@@ -24,11 +24,26 @@ import os
 import random
 import timeit
 import json
-
+from scipy.special import logsumexp
 import numpy as np
 import pathlib
 import torch
+torch.cuda.empty_cache()
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler, SubsetRandomSampler
+from tqdm import tqdm, trange
+
+import pandas as pd
+import json
+import os
+import time
+import logging
+import random
+import timeit
+import re
+
+import torch
+import tensorflow_datasets as tfds
+from torch.utils.data import DataLoader, SequentialSampler, RandomSampler
 from tqdm import tqdm, trange
 
 import transformers
@@ -41,6 +56,7 @@ from transformers import (
     AutoTokenizer,
     get_linear_schedule_with_warmup,
     squad_convert_examples_to_features,
+    squad_convert_examples_to_features_with_segmentation,
 )
 from utils import (
     compute_predictions_logits,
@@ -48,7 +64,7 @@ from utils import (
 )
 from transformers.data.processors.squad import SquadResult, SquadV1Processor, SquadV2Processor
 from transformers.trainer_utils import is_main_process
-
+torch.cuda.empty_cache()
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -59,7 +75,6 @@ logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_QUESTION_ANSWERING_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-
 
 def set_seed(args):
     if args.seed is None:
@@ -89,6 +104,70 @@ def get_dataset_pos_mask(dataset):
         pos_mask.append(is_positive)
     return pos_mask
 
+
+
+def get_segment_start_char_index(context, sp_set, shifted_sp_set):
+    mini_context = []
+    pattern1 = f'({sp_set[0]})' + r'\w*\s*' + f'({shifted_sp_set[0][0:5]})'
+    prev_id_list = list(re.finditer(pattern1, context, re.IGNORECASE))
+    if len(prev_id_list) > 1:
+      prev_id = prev_id_list[1].start()
+    else:
+      prev_id = prev_id_list[0].start()
+    context_main = context[prev_id:]
+
+    for i in range(1,len(sp_set)):
+        # pattern = sp_set[i] # +'\s*'+shifted_sp_set[i]
+        pattern = f'({sp_set[i]})' + r'\w*\s*' + f'({shifted_sp_set[i][0:5]})'
+        match = re.search(pattern,context_main)
+        if match:
+            curr_id = match.start() #context_main.find(sp_set[i + 1])
+            mini_context.append((prev_id, context_main[:curr_id]))
+            context_main = context_main[curr_id:]
+            prev_id += curr_id
+
+    mini_context.append((prev_id,context_main))
+    # print(mini_context[-1][0], len(mini_context[-1][1]), len(context))
+    assert mini_context[-1][0] + len(mini_context[-1][1]) == len(context)
+
+    return [item[0] for item in mini_context]
+
+def _is_whitespace(c):
+    if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
+        return True
+    return False
+
+def get_segment_start_index(context_seg_list):
+    segment_start_indexes = []
+    for context_seg in context_seg_list:
+        title, context, ssn_set, shifted_ssn_set, replica = context_seg["title"], context_seg["context"], context_seg["ssn_set"], context_seg["shifted_ssn_set"], context_seg["replica"]
+
+        segment_start_index = []
+
+        doc_tokens = []
+        doc_chrs = []
+        prev_is_whitespace = True
+        segment_start_char_index = get_segment_start_char_index(context, ssn_set, shifted_ssn_set)
+
+        for index in range(len(context)):
+            c = context[index]
+            if index in segment_start_char_index:
+                segment_start_index.append(len(doc_tokens))
+            if _is_whitespace(c):
+                prev_is_whitespace = True
+            else:
+                doc_chrs.append(c)
+                if prev_is_whitespace:
+                    doc_tokens.append(c)
+                else:
+                    doc_tokens[-1] += c
+                prev_is_whitespace = False
+
+        print(f"segment_start_index for {title} is {segment_start_index}")
+        for i in range(replica):
+            segment_start_indexes.append(segment_start_index)
+
+    return segment_start_indexes
 
 def get_random_subset(dataset, keep_frac=1):
     """
@@ -311,7 +390,7 @@ def train(args, train_dataset, model, tokenizer):
 def evaluate(args, model, tokenizer, prefix=""):
     dataset, examples, features = load_and_cache_examples(args, tokenizer, evaluate=True, output_examples=True)
 
-    with open(args.predict_file, "r") as f:
+    with open(args.test_file, "r") as f:
         json_test_dict = json.load(f)
 
     if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
@@ -334,108 +413,224 @@ def evaluate(args, model, tokenizer, prefix=""):
 
     all_results = []
     start_time = timeit.default_timer()
-
+    total_loss = []
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         model.eval()
         batch = tuple(t.to(args.device) for t in batch)
 
         with torch.no_grad():
+            #inputs = {
+            #    "input_ids": batch[0],
+            #    "attention_mask": batch[1],
+            #    "token_type_ids": batch[2],
+            #}
             inputs = {
                 "input_ids": batch[0],
                 "attention_mask": batch[1],
                 "token_type_ids": batch[2],
+                "start_positions":batch[3],
+                "end_positions":batch[4],
             }
 
             if args.model_type in ["xlm", "roberta", "distilbert", "camembert", "bart", "longformer"]:
                 del inputs["token_type_ids"]
 
-            feature_indices = batch[3]
+            #feature_indices = batch[3]
 
             # XLNet and XLM use more arguments for their predictions
             if args.model_type in ["xlnet", "xlm"]:
                 raise NotImplementedError
             outputs = model(**inputs)
+            batch_loss = outputs["loss"].item()
+            if not np.isnan(batch_loss):
+                total_loss.append(batch_loss)
 
-        for i, feature_index in enumerate(feature_indices):
-            eval_feature = features[feature_index.item()]
-            unique_id = int(eval_feature.unique_id)
-
-            output = [to_list(output[i]) for output in outputs.to_tuple()]
-
-            # Some models (XLNet, XLM) use 5 arguments for their predictions, while the other "simpler"
+        #for i, feature_index in enumerate(feature_indices):
+        #    eval_feature = features[feature_index.item()]
+        #    unique_id = int(eval_feature.unique_id)
+#
+#            output = [to_list(output[i]) for output in outputs.to_tuple()]
+#            print("Output modified:",output)
+# Some models (XLNet, XLM) use 5 arguments for their predictions, while the other "simpler"
             # models only use two.
-            if len(output) >= 5:
-                start_logits = output[0]
-                start_top_index = output[1]
-                end_logits = output[2]
-                end_top_index = output[3]
-                cls_logits = output[4]
+#            if len(output) >= 5:
+#               start_logits = output[0]
+#                start_top_index = output[1]
+#                end_logits = output[2]
+#                end_top_index = output[3]
+#                cls_logits = output[4]
+#
+#                result = SquadResult(
+#                    unique_id,
+#                    start_logits,
+#                    end_logits,
+#                    start_top_index=start_top_index,
+#                    end_top_index=end_top_index,
+#                    cls_logits=cls_logits,
+#                )
 
-                result = SquadResult(
-                    unique_id,
-                    start_logits,
-                    end_logits,
-                    start_top_index=start_top_index,
-                    end_top_index=end_top_index,
-                    cls_logits=cls_logits,
-                )
+#            else:
+#                start_logits, end_logits = output
+#               result = SquadResult(unique_id, start_logits, end_logits)
 
-            else:
-                start_logits, end_logits = output
-                result = SquadResult(unique_id, start_logits, end_logits)
-
-            all_results.append(result)
-
+#            all_results.append(result)
+    mean_loss = np.mean(-logsumexp(-np.array(total_loss)))
     evalTime = timeit.default_timer() - start_time
     logger.info("  Evaluation done in total %f secs (%f sec per example)", evalTime, evalTime / len(dataset))
 
     # Compute predictions
-    output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(prefix))
-    output_nbest_file = os.path.join(args.output_dir, "nbest_predictions_{}.json".format(prefix))
+    #output_prediction_file = os.path.join(args.output_dir, "predictions_{}.json".format(prefix))
+    #output_nbest_file = os.path.join(args.output_dir, "nbest_predictions_{}.json".format(prefix))
 
-    if args.version_2_with_negative:
-        output_null_log_odds_file = os.path.join(args.output_dir, "null_odds_{}.json".format(prefix))
-    else:
-        output_null_log_odds_file = None
+    #if args.version_2_with_negative:
+    #    output_null_log_odds_file = os.path.join(args.output_dir, "null_odds_{}.json".format(prefix))
+    #else:
+    #    output_null_log_odds_file = None
 
     # XLNet and XLM use a more complex post-processing procedure
-    if args.model_type in ["xlnet", "xlm"]:
-        raise NotImplementedError
-    else:
-        predictions = compute_predictions_logits(
-            json_test_dict,
-            examples,
-            features,
-            all_results,
-            args.n_best_size,
-            args.max_answer_length,
-            args.do_lower_case,
-            output_prediction_file,
-            output_nbest_file,
-            output_null_log_odds_file,
-            args.verbose_logging,
-            args.version_2_with_negative,
-            args.null_score_diff_threshold,
-            tokenizer,
-        )
+    #if args.model_type in ["xlnet", "xlm"]:
+    #    raise NotImplementedError
+    #else:
+    #    predictions = compute_predictions_logits(
+    #        json_test_dict,
+    #        examples,
+    #        features,
+    #        all_results,
+    #        args.n_best_size,
+    #        args.max_answer_length,
+    #        args.do_lower_case,
+    #        output_prediction_file,
+    #        output_nbest_file,
+    #        output_null_log_odds_file,
+    #        args.verbose_logging,
+    #        args.version_2_with_negative,
+    #        args.null_score_diff_threshold,
+    #        tokenizer,
+    #    )
 
     # Compute the F1 and exact scores.
-    results = squad_evaluate(examples, predictions)
-    print(results)
-    return results
+    #results = squad_evaluate(examples, predictions)
+    #print(results)
+    print("Loss is: ",mean_loss)
+    return mean_loss
 
 
-def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False):
+def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False, segment_start_indexes, stride_cannot_exceed_doc_stride=None):
+    def load_data(input_json_path, input_csv_path):
+        df = pd.read_json(input_json_path)
+
+        json_files = []
+        for data in df.data:
+            json_file = {
+            'title': data["title"],
+            'context': data["paragraphs"][0]["context"],
+            'replica': len(data["paragraphs"][0]["qas"])
+            }
+            json_files.append(json_file)
+
+        chars_to_replace = {
+            '\xa0': ' ',  # Replace non-breaking space with a regular space
+            'I.1':'1.1',
+            'Section1':'Section 1',
+            '           ':' ',
+            '\\[':'\[',
+            '\\]':'\]'
+        }
+
+
+        context_seg_list = []
+        for json_file in json_files:
+            ssn_set,shifted_ssn_set = [],[]
+            title, context, replica = json_file["title"], json_file["context"], json_file["replica"]
+            df_seg = pd.read_csv(input_csv_path.format(title))
+            df_seg['text'] = df_seg['text'].replace(chars_to_replace,regex=True)
+            # ssn_set = df_seg[(df_seg['tagged_sequence'] == 's_ssn') | (df_seg['tagged_sequence'] == 'b_ssn')]['text'].values
+            ssn_set = df_seg[df_seg['tagged_sequence'] == 's_ssn']['text'].values
+            del_set = set([i for i,title in enumerate(ssn_set) if len(title)>20])
+            ssn_set = [title.strip() for i,title in enumerate(ssn_set) if i not in del_set]
+            shifted_df_seg = df_seg.shift(-1)
+            shifted_ssn_set = shifted_df_seg[df_seg['tagged_sequence'] == 's_ssn']['text'].values
+            shifted_ssn_set = [title for i,title in enumerate(shifted_ssn_set) if i not in del_set]
+
+            context_seg_list.append({"title":title, "context": context, "ssn_set": ssn_set, "shifted_ssn_set":shifted_ssn_set, "replica":replica})
+
+            print(title)
+
+        return context_seg_list
+    
+    def get_segment_start_char_index(context, sp_set, shifted_sp_set):
+        mini_context = []
+        pattern1 = f'({sp_set[0]})' + r'\w*\s*' + f'({shifted_sp_set[0][0:5]})'
+        prev_id_list = list(re.finditer(pattern1, context, re.IGNORECASE))
+        if len(prev_id_list) > 1:
+        prev_id = prev_id_list[1].start()
+        else:
+        prev_id = prev_id_list[0].start()
+        context_main = context[prev_id:]
+
+        for i in range(1,len(sp_set)):
+            # pattern = sp_set[i] # +'\s*'+shifted_sp_set[i]
+            pattern = f'({sp_set[i]})' + r'\w*\s*' + f'({shifted_sp_set[i][0:5]})'
+            match = re.search(pattern,context_main)
+            if match:
+                curr_id = match.start() #context_main.find(sp_set[i + 1])
+                mini_context.append((prev_id, context_main[:curr_id]))
+                context_main = context_main[curr_id:]
+                prev_id += curr_id
+
+        mini_context.append((prev_id,context_main))
+        # print(mini_context[-1][0], len(mini_context[-1][1]), len(context))
+        assert mini_context[-1][0] + len(mini_context[-1][1]) == len(context)
+
+        return [item[0] for item in mini_context]
+
+    def _is_whitespace(c):
+        if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
+            return True
+        return False
+
+    def get_segment_start_index(context_seg_list):
+        segment_start_indexes = []
+        for context_seg in context_seg_list:
+            title, context, ssn_set, shifted_ssn_set, replica = context_seg["title"], context_seg["context"], context_seg["ssn_set"], context_seg["shifted_ssn_set"], context_seg["replica"]
+
+            segment_start_index = []
+
+            doc_tokens = []
+            doc_chrs = []
+            prev_is_whitespace = True
+            segment_start_char_index = get_segment_start_char_index(context, ssn_set, shifted_ssn_set)
+
+            for index in range(len(context)):
+                c = context[index]
+                if index in segment_start_char_index:
+                    segment_start_index.append(len(doc_tokens))
+                if _is_whitespace(c):
+                    prev_is_whitespace = True
+                else:
+                    doc_chrs.append(c)
+                    if prev_is_whitespace:
+                        doc_tokens.append(c)
+                    else:
+                        doc_tokens[-1] += c
+                    prev_is_whitespace = False
+
+            print(f"segment_start_index for {title} is {segment_start_index}")
+            for i in range(replica):
+                segment_start_indexes.append(segment_start_index)
+
+        return segment_start_indexes
     if args.local_rank not in [-1, 0] and not evaluate:
         # Make sure only the first process in distributed training process the dataset, and the others will use the cache
         torch.distributed.barrier()
 
     # Load data features from cache or dataset file
     input_dir = args.data_dir if args.data_dir else "."
+    csv_files_dir = args.csv_dir
     cached_features_file = os.path.join(
         args.cache_dir,
         "cached_{}_{}_{}".format(
-            "dev" if evaluate else "train",
+            "test" if evaluate else "train_and_dev",
             list(filter(None, args.model_name_or_path.split("/"))).pop(),
             str(args.max_seq_length),
         ),
@@ -443,7 +638,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
     subset_cached_features_file = os.path.join(
         args.cache_dir,
         "balanced_subset_cached_{}_{}_{}".format(
-            "dev" if evaluate else "train",
+            "test" if evaluate else "train_and_dev",
             list(filter(None, args.model_name_or_path.split("/"))).pop(),
             str(args.max_seq_length),
         ),
@@ -474,7 +669,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
     else:
         logger.info("Creating features from dataset file at %s", input_dir)
 
-        if not args.data_dir and ((evaluate and not args.predict_file) or (not evaluate and not args.train_file)):
+        if not args.data_dir and ((evaluate and not args.test_file) or (not evaluate and not args.train_file)):
             try:
                 import tensorflow_datasets as tfds
             except ImportError:
@@ -488,10 +683,15 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
         else:
             processor = SquadV2Processor() if args.version_2_with_negative else SquadV1Processor()
             if evaluate:
-                examples = processor.get_dev_examples(args.data_dir, filename=args.predict_file)
+                examples = processor.get_dev_examples(args.data_dir, filename=args.test_file)
+                context_seg_list = load_data(args.data_dir+args.test_file, args.csv_dir+'{}.csv')
+                segment_start_indexes = get_segment_start_index(context_seg_list)
+                stride_cannot_exceed_doc_stride = True
             else:
                 examples = processor.get_train_examples(args.data_dir, filename=args.train_file)
-
+                context_seg_list = load_data(args.data_dir+args.train_file, args.csv_dir+'{}.csv')
+                segment_start_indexes = get_segment_start_index(context_seg_list)
+                stride_cannot_exceed_doc_stride = True
         features, dataset = squad_convert_examples_to_features(
             examples=examples,
             tokenizer=tokenizer,
@@ -501,6 +701,8 @@ def load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=Fal
             is_training=not evaluate,
             return_dataset="pt",
             threads=args.threads,
+            segment_start_indexes = segment_start_indexes,
+            stride_cannot_exceed_doc_stride = stride_cannot_exceed_doc_stride,
         )
 
         if evaluate:
@@ -556,6 +758,12 @@ def main():
         help="The input data dir. Should contain the .json files for the task."
         + "If no data dir or train/predict files are specified, will run with tensorflow_datasets.",
     )
+    parser.add_arguments(
+        '--csv_dir',
+        default=None,
+        type=str,
+        help="The locationf for the csv files, using with the xpaths from which the segmentation will work"
+    )
     parser.add_argument(
         "--train_file",
         default=None,
@@ -564,7 +772,15 @@ def main():
         + "If no data dir or train/predict files are specified, will run with tensorflow_datasets.",
     )
     parser.add_argument(
-        "--predict_file",
+        "--validation_file",
+        default=None,
+        type=str,
+        help="The input dev file. If a data dir is specified, will look for the file there"
+        + "If no data dir or train/predict files are specified, will run with tensorflow_datasets.",
+    )
+
+    parser.add_argument(
+        "--test_file",
         default=None,
         type=str,
         help="The input evaluation file. If a data dir is specified, will look for the file there"
@@ -835,7 +1051,7 @@ def main():
 
         # Load a trained model and vocabulary that you have fine-tuned
         model = AutoModelForQuestionAnswering.from_pretrained(args.output_dir)  # , force_download=True)
-
+        
         # SquadDataset is not compatible with Fast tokenizers which have a smarter overflow handeling
         # So we use use_fast=False here for now until Fast-tokenizer-compatible-examples are out
         tokenizer = AutoTokenizer.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case, use_fast=False)
@@ -847,10 +1063,10 @@ def main():
         # Evaluate
         global_step = ""
         result = evaluate(args, model, tokenizer, prefix=global_step)
-        result = dict((k + ("_{}".format(global_step) if global_step else ""), v) for k, v in result.items())
-        results.update(result)
-
-    return results
+        #result = dict((k + ("_{}".format(global_step) if global_step else ""), v) for k, v in result.items())
+        #results.update(result)
+        
+    return result
 
 
 if __name__ == "__main__":

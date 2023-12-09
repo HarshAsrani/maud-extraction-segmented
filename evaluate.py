@@ -195,7 +195,7 @@ import argparse
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model_path", type=str)
-    parser.add_argument("-E", "--eval_split", choices=["dev", "test"], default="dev", type=str)
+    parser.add_argument("-E", "--eval_split", choices=["dev", "test","test_one_answer"], default="dev", type=str)
     args = parser.parse_args()
 
     print(f"Evaluating on {args.eval_split} split.")

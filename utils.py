@@ -34,7 +34,8 @@ import json
 from transformers.models.bert import BasicTokenizer
 from transformers.utils import logging
 from tqdm import tqdm
-
+import torch
+import torch.nn.functional as F
 
 logger = logging.get_logger(__name__)
 
@@ -708,7 +709,7 @@ def compute_predictions_logits(
         null_score_diff_threshold=null_score_diff_threshold,
     )
 
-    for preds, nbests, score_diffs in process_map(worker, jobs, max_workers=8):
+    for preds, nbests, score_diffs, losses in process_map(worker, jobs, max_workers=8):
         all_predictions.update(preds)
         all_nbest_json.update(nbests)
         all_scores_diff_json.update(score_diffs)
@@ -756,6 +757,10 @@ def _worker(job, example_index_to_features, contract_name_to_idx, json_input_dic
                 feature_null_score = result.start_logits[0] + result.end_logits[0]
                 if feature_null_score < score_null:
                     score_null = feature_null_score
+                    min_null_feature_index = feature_index
+                    null_start_logit = result.start_logits[0]
+                    null_end_logit = result.end_logits[0]
+            for start_index in start_indexes:
                     min_null_feature_index = feature_index
                     null_start_logit = result.start_logits[0]
                     null_end_logit = result.end_logits[0]
@@ -840,10 +845,6 @@ def _worker(job, example_index_to_features, contract_name_to_idx, json_input_dic
             else:
                 final_text = ""
                 seen_predictions[final_text] = True
-
-                start_indexes.append(-1)
-                end_indexes.append(-1)
-
             nbest.append(_NbestPrediction(text=final_text, start_logit=pred.start_logit, end_logit=pred.end_logit))
 
         # if we didn't include the empty option in the n-best, include it
